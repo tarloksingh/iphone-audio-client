@@ -17,7 +17,7 @@ import Flutter
       
       // Instead of using a fixed value, you can experiment with different low buffer durations.
       // Here we choose 3ms (0.003s) as a starting point; adjust as needed.
-      let preferredBufferDuration = 0.003
+      let preferredBufferDuration = 0.002
       try audioSession.setPreferredIOBufferDuration(preferredBufferDuration)
       
       // Match your sample rate with your recording settings.
