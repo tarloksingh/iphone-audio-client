@@ -1,15 +1,14 @@
-import 'dart:typed_data';
-import 'dart:math';
-
 class NLMS_EchoCanceller {
-  final int filterLength; // In samples (e.g. measured latency in samples + margin)
-  double mu;            // Adaptation factor (should be low)
-  final double epsilon; // Small constant to prevent division by zero
+  final int sampleRate;   // New: store sampleRate for possible future use.
+  final int filterLength; // In samples (e.g. measured latency in samples plus margin)
+  double mu;              // Adaptation factor.
+  final double epsilon;   // Small constant to prevent division by zero.
   late List<double> weights;
   late List<double> xBuffer;
   int bufferIndex = 0;
 
   NLMS_EchoCanceller({
+    required this.sampleRate,
     required this.filterLength,
     this.mu = 0.005,
     this.epsilon = 1e-6,
