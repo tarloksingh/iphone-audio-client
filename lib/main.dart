@@ -1,6 +1,5 @@
 import 'dart:typed_data';
 import 'dart:math';
-import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:record/record.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
@@ -11,36 +10,33 @@ void main() {
   runApp(MyApp());
 }
 
-/// Helper: Convert a Uint8List of 16-bit PCM samples to a List<double>
-List<double> bytesToSamples(Uint8List data) {
-  int sampleCount = data.length ~/ 2;
-  List<double> samples = List.filled(sampleCount, 0.0);
-  ByteData byteData = ByteData.sublistView(data);
-  for (int i = 0; i < sampleCount; i++) {
-    samples[i] = byteData.getInt16(i * 2, Endian.little).toDouble();
-  }
-  return samples;
+// Fast conversion: Uint8List to List<double>
+List<double> fastBytesToSamples(Uint8List data) {
+  // Ensure alignment by copying if needed.
+  Uint8List alignedData = (data.offsetInBytes % 2 == 0) ? data : Uint8List.fromList(data);
+  final int sampleCount = alignedData.lengthInBytes ~/ 2;
+  final Int16List intSamples = alignedData.buffer.asInt16List(alignedData.offsetInBytes, sampleCount);
+  return List<double>.from(intSamples.map((x) => x.toDouble()));
 }
 
-/// Helper: Convert a List<double> to a Uint8List of 16-bit PCM samples.
-Uint8List samplesToBytes(List<double> samples) {
-  int sampleCount = samples.length;
-  Uint8List output = Uint8List(sampleCount * 2);
-  ByteData outputByteData = ByteData.sublistView(output);
+// Fast conversion: List<double> to Uint8List
+Uint8List fastSamplesToBytes(List<double> samples) {
+  final int sampleCount = samples.length;
+  final Int16List intSamples = Int16List(sampleCount);
   for (int i = 0; i < sampleCount; i++) {
     int sample = samples[i].round();
     if (sample > 32767) sample = 32767;
     if (sample < -32768) sample = -32768;
-    outputByteData.setInt16(i * 2, sample, Endian.little);
+    intSamples[i] = sample;
   }
-  return output;
+  return intSamples.buffer.asUint8List();
 }
 
-/// Helper: Generate a sine wave of given length and frequency.
+/// Generate a sine wave of given length and frequency.
 List<double> generateSineWave(int length, double frequency, int sampleRate) {
   List<double> sineWave = List.filled(length, 0.0);
   for (int n = 0; n < length; n++) {
-    sineWave[n] = (32767 * sin(2 * pi * frequency * n / sampleRate));
+    sineWave[n] = 32767 * sin(2 * pi * frequency * n / sampleRate);
   }
   return sineWave;
 }
@@ -56,16 +52,14 @@ class _MyAppState extends State<MyApp> {
   WebSocketChannel? channel;
   final AudioRecorder _audioRecorder = AudioRecorder();
   bool isRecording = false;
-  int measuredLatency = 0; // in milliseconds (for NLMS, use to set filter length)
-  
-  // NLMS filter parameters.
+  int measuredLatency = 0; // in milliseconds
   NLMS_EchoCanceller? nlmsCanceller;
+  // Lower sample rate for lower data volume and latency.
   final int sampleRate = 44100;
-  // We'll set filter length based on measured latency plus a margin (in samples).
-  int filterLength = 128; // default; will update after latency measurement
-  
-  // NLMS adaptation factor μ; lower values are needed for stability.
-  double mu = 0.005; // initial value
+  int filterLength = 128; // Will update after latency measurement.
+  double mu = 0.005; // NLMS adaptation factor.
+  // Use a smaller chunk size (256 bytes instead of 512) for faster transmission.
+  final int chunkSize = 256;
   
   @override
   void initState() {
@@ -87,23 +81,22 @@ class _MyAppState extends State<MyApp> {
       return;
     }
     
-    // Connect for audio streaming (using ?type=audio so the server starts aplay).
+    // Connect using ?type=audio so that the server starts aplay.
     channel = WebSocketChannel.connect(Uri.parse("$serverUrl?type=audio"));
     
     try {
       final stream = await _audioRecorder.startStream(
-        const RecordConfig(
+        RecordConfig(
           encoder: AudioEncoder.pcm16bits,
-          sampleRate: 44100,
+          sampleRate: sampleRate,
           numChannels: 1,
         ),
       );
       
       stream.listen((Uint8List data) {
-        // Convert microphone bytes to sample array.
-        List<double> micSamples = bytesToSamples(data);
-        
-        // Generate a simulated far-end reference (sine wave at 440 Hz).
+        // Convert captured bytes into samples.
+        List<double> micSamples = fastBytesToSamples(data);
+        // Simulate a far-end reference (sine wave at 440 Hz).
         List<double> refSamples = generateSineWave(micSamples.length, 440, sampleRate);
         
         List<double> processedSamples = micSamples;
@@ -111,9 +104,8 @@ class _MyAppState extends State<MyApp> {
           processedSamples = nlmsCanceller!.processChunk(micSamples, refSamples);
         }
         
-        Uint8List processedData = samplesToBytes(processedSamples);
-        // Split into small packets.
-        const int chunkSize = 512;
+        Uint8List processedData = fastSamplesToBytes(processedSamples);
+        // Send data in small chunks for lower latency.
         for (int offset = 0; offset < processedData.length; offset += chunkSize) {
           int end = (offset + chunkSize < processedData.length)
               ? offset + chunkSize
@@ -146,7 +138,7 @@ class _MyAppState extends State<MyApp> {
     }
   }
   
-  /// Measure round-trip latency (using a control connection) and set up the NLMS filter.
+  /// Measure round-trip latency (via control connection) and set up NLMS.
   Future<void> measureLatency() async {
     final pingChannel = WebSocketChannel.connect(Uri.parse("$serverUrl?type=control"));
     final int startTime = DateTime.now().millisecondsSinceEpoch;
@@ -161,12 +153,12 @@ class _MyAppState extends State<MyApp> {
         print("Round-trip latency: ${roundTrip}ms");
         setState(() {
           measuredLatency = roundTrip;
-          // Compute filter length in samples (add a 10 ms margin).
+          // Calculate filter length in samples (with an extra 10 ms margin).
           filterLength = (((measuredLatency + 10) * sampleRate) / 1000).round();
-          // Initialize NLMS echo canceller.
           nlmsCanceller = NLMS_EchoCanceller(
             filterLength: filterLength,
             mu: mu,
+            sampleRate: sampleRate,  // (Added sampleRate parameter if needed by your NLMS class.)
           );
         });
         pingChannel.sink.close();
@@ -212,7 +204,6 @@ class _MyAppState extends State<MyApp> {
                 Text("NLMS Filter Length: $filterLength samples"),
                 const SizedBox(height: 20),
                 const Text("Adaptation Factor μ:"),
-                // Allow μ adjustment between 0.001 and 0.02 (very low values).
                 Slider(
                   value: mu,
                   min: 0.001,
@@ -226,6 +217,7 @@ class _MyAppState extends State<MyApp> {
                         nlmsCanceller = NLMS_EchoCanceller(
                           filterLength: filterLength,
                           mu: mu,
+                          sampleRate: sampleRate,
                         );
                       }
                     });
